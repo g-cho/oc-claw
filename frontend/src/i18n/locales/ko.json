@@ -369,6 +369,7 @@
     "titleGemini": "Gemini CLI 통계",
     "titleHermes": "Hermes Agent 통계",
     "titleOpencode": "opencode 통계",
+    "titleZcode": "ZCode 통계",
     "last14Days": "최근 14일",
     "totalTokens": "총 토큰",
     "sessionsCount": "세션",

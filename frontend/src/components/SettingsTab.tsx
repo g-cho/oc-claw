@@ -695,6 +695,8 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
   const [geminiHookStatus, setGeminiHookStatus] = useState('')
   const [enableOpencode, setEnableOpencode] = useState(true)
   const [opencodeHookStatus, setOpencodeHookStatus] = useState('')
+  const [enableZcode, setEnableZcode] = useState(true)
+  const [zcodeHookStatus, setZcodeHookStatus] = useState('')
   const [hermesHookStatus] = useState('')
   const [enableAutostart, setEnableAutostart] = useState(false)
   const [autostartStatus, setAutostartStatus] = useState('')
@@ -762,6 +764,8 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
       if (typeof gem === 'boolean') setEnableGemini(gem)
       const oc = await store.get('enable_opencode')
       if (typeof oc === 'boolean') setEnableOpencode(oc)
+      const zc = await store.get('enable_zcode')
+      if (typeof zc === 'boolean') setEnableZcode(zc)
       // Reconcile autostart toggle with the system: the OS-level registration
       // (registry on Windows, LaunchAgent on macOS) is the source of truth in
       // case the user disabled it externally; mirror that into our store so
@@ -973,6 +977,21 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
         setOpencodeHookStatus(t('settings.hookInstalled'))
       } catch (e: any) {
         setOpencodeHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
+      }
+    }
+  }
+
+  const toggleZcode = async (val: boolean) => {
+    setEnableZcode(val)
+    const store = await getStore()
+    await store.set('enable_zcode', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_zcode_hooks')
+        setZcodeHookStatus(t('settings.hookInstalled'))
+      } catch (e: any) {
+        setZcodeHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
       }
     }
   }
@@ -1215,6 +1234,21 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
               {opencodeHookStatus && <span className="text-xs text-white/30 mt-1">{opencodeHookStatus}</span>}
             </div>
             <Toggle checked={enableOpencode} onChange={toggleOpencode} />
+          </div>
+        </div>
+      </section>
+
+      {/* ZCode */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">ZCode</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.enableZcode', 'Enable ZCode')}</span>
+              <span className="text-xs text-white/40">{t('settings.enableZcodeDesc', 'Monitor local ZCode sessions via hooks')}</span>
+              {zcodeHookStatus && <span className="text-xs text-white/30 mt-1">{zcodeHookStatus}</span>}
+            </div>
+            <Toggle checked={enableZcode} onChange={toggleZcode} />
           </div>
         </div>
       </section>

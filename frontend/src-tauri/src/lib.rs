@@ -7985,8 +7985,11 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                 "waiting" | "processing" | "tool_running" | "compacting");
             if !dominated { continue; }
 
-            let is_desktop_hosted = session.host_terminal.as_deref() == Some("Claude Desktop");
-            if session.source == "cursor" || session.source == "codex" || session.source == "opencode" || is_desktop_hosted {
+                let is_desktop_hosted = session.host_terminal.as_deref() == Some("Claude Desktop");
+                // zcode joins the timeout branch too: its hook pid is the
+                // desktop host (always alive while the app runs), so a
+                // PID-liveness check could never detect a finished turn.
+                if session.source == "cursor" || session.source == "codex" || session.source == "opencode" || session.source == "zcode" || is_desktop_hosted {
                 if session.source == "codex" {
                     if let Some(path) = resolve_session_jsonl_path(&session.session_id, Some(&session.cwd)) {
                         if let Some((tool, tool_input)) = codex_pending_approval(&path) {
@@ -8669,6 +8672,14 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
     // Returning empty stats lets the frontend render a "not supported" hint
     // instead of mixing in Claude Code's totals as if they were Cursor's.
     if source == "cursor" {
+        return Ok(empty_claude_stats());
+    }
+
+    // ZCode persists conversations/token usage in its own SQLite DB
+    // (~/.zcode/cli/db/db.sqlite), which v1 does not parse. Return empty
+    // stats so the frontend renders the "not supported" hint instead of
+    // mixing in Claude Code's totals as if they were ZCode's.
+    if source == "zcode" {
         return Ok(empty_claude_stats());
     }
 
@@ -10625,6 +10636,15 @@ async fn jump_to_claude_terminal(session_id: String, state: tauri::State<'_, Cla
             // continue with terminal-based fallback paths below.
         }
 
+        // ZCode desktop sessions jump to the ZCode app directly (same reasoning
+        // as codex: no terminal flash). If the ZCode app bundle isn't found,
+        // fall through to the pid/terminal-based paths below.
+        if source == "zcode" {
+            if try_activate_app("ZCode") {
+                return Ok("Activated ZCode".to_string());
+            }
+        }
+
         // CC Desktop sessions must short-circuit before the Ghostty fast path.
         // The unix hook script unconditionally captures Ghostty's current
         // front-tab id whenever Ghostty is running (it predates CC Desktop
@@ -11058,6 +11078,15 @@ end tell"#,
             if let Some(p) = find_pid_by_exe_names(exe_names) {
                 activate_window_by_pid(p);
                 return Ok("Activated Codex window".to_string());
+            }
+        } else if source == "zcode" {
+            // ZCode desktop app (Electron). Normally the pid-ancestor walk
+            // above already lands on ZCode.exe; this covers the case where
+            // the hook reported no usable pid (e.g. CLI run in a terminal).
+            let exe_names = &["ZCode.exe"];
+            if let Some(p) = find_pid_by_exe_names(exe_names) {
+                activate_window_by_pid(p);
+                return Ok("Activated ZCode window".to_string());
             }
         } else if source == "gemini" {
             let terminal_exes = &[
@@ -12969,6 +12998,280 @@ except:
     Ok(())
 }
 
+// ─── ZCode Integration ────────────────────────────────────────────────
+
+/// ZCode hook events supported by the ZCode core (verified against
+/// zcode.cjs 0.17.1 — there is NO SubagentStop / PreCompact / SessionEnd).
+/// Event names are CC-compatible PascalCase, and the stdin payload uses the
+/// same raw field names as CC (session_id / cwd / hook_event_name / tool_name
+/// / tool_input / last_assistant_message), so the Rust side can consume the
+/// forwarded raw JSON without per-event remapping.
+const ZCODE_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
+];
+
+/// True if a hook config entry ({"hooks":[{type:process, command, args}]})
+/// belongs to oc-claw's ZCode integration. Matching on the script filename
+/// only — the user's own hooks (e.g. other pet projects) must be preserved.
+fn zcode_has_our_hook(entry: &serde_json::Value) -> bool {
+    let Some(hooks) = entry.get("hooks").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    hooks.iter().any(|h| {
+        let command = h.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let args_join = h
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        command.contains("ooclaw-zcode-hook") || args_join.contains("ooclaw-zcode-hook")
+    })
+}
+
+/// Install hooks for ZCode (Z.ai CLI/desktop agent).
+///
+/// Writes ~/.zcode/hooks/ooclaw-zcode-hook.js (Windows, run with `node`) or
+/// .sh (Unix, python3-based) and registers it for all ZCode hook events inside
+/// `~/.zcode/cli/config.json`:
+///   { "hooks": { "enabled": true, "timeoutMs": 1000,
+///                "events": { "SessionStart": [ { "hooks": [ ... ] } ], ... } } }
+/// Notes:
+/// - `hooks.enabled` MUST be true or config-file hooks are ignored entirely.
+/// - Entry format is `type:"process"` (command + args, no shell). ZCode runs
+///   hooks inline, so the script must be fast — hence node on Windows (see the
+///   comment in the Windows branch for the PowerShell post-mortem).
+/// - Existing user hook entries are preserved; only entries whose command/args
+///   contain "ooclaw-zcode-hook" are replaced (idempotent re-install).
+#[tauri::command]
+async fn install_zcode_hooks() -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let zcode_dir = home.join(".zcode");
+
+    // Skip if ~/.zcode/ doesn't exist (ZCode not installed)
+    if !zcode_dir.exists() {
+        log::info!("[zcode_hooks] ~/.zcode/ not found — skipping");
+        return Ok(());
+    }
+
+    let hooks_dir = zcode_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir).map_err(|e| e.to_string())?;
+
+    #[cfg(unix)]
+    let hook_path = hooks_dir.join("ooclaw-zcode-hook.sh");
+    #[cfg(windows)]
+    let hook_path = hooks_dir.join("ooclaw-zcode-hook.js");
+
+    // Remove the old PowerShell hook from earlier builds. It was replaced by
+    // the node script below: PowerShell 5.1 cold start (~0.5-1s) plus a
+    // Win32_Process WMI parent walk (~2s+) blew past ZCode's per-hook timeout
+    // (hook.run.failed "timed_out" at 3022ms) AND delayed every tool call,
+    // because ZCode runs config hooks inline.
+    #[cfg(windows)]
+    {
+        let legacy_ps1 = hooks_dir.join("ooclaw-zcode-hook.ps1");
+        if legacy_ps1.exists() {
+            let _ = std::fs::remove_file(&legacy_ps1);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        // ZCode hook script: forwards the raw stdin JSON to the Unix socket.
+        // Only PostToolUseFailure needs rewriting (see below); everything else
+        // is passed through untouched because process_claude_event already
+        // understands CC-style raw field names.
+        let hook_script = r#"#!/bin/bash
+# ooclaw ZCode hook - forwards events to /tmp/ooclaw-zcode.sock
+SOCKET_PATH="/tmp/ooclaw-zcode.sock"
+[ -S "$SOCKET_PATH" ] || exit 0
+
+# Capture the ZCode core PID (parent of this hook process) for jump support
+export ZCODE_PID=$PPID
+
+/usr/bin/python3 -c "
+import json, os, socket, sys
+
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(0)
+
+# PostToolUseFailure is ZCode-specific. Rewrite before forwarding:
+# - is_interrupted=true  -> Stop   (ESC interrupt; oc-claw has no transcript
+#                                   watcher for ZCode, so this is the only
+#                                   reliable interrupt signal)
+# - otherwise            -> PostToolUse (a failed tool does not end the turn)
+try:
+    data = json.loads(raw)
+except Exception:
+    data = None
+if isinstance(data, dict) and data.get('hook_event_name') == 'PostToolUseFailure':
+    data['hook_event_name'] = 'Stop' if data.get('is_interrupted') else 'PostToolUse'
+    raw = json.dumps(data, ensure_ascii=False)
+
+pid = int(os.environ.get('ZCODE_PID', '0') or 0)
+if isinstance(data, dict) and pid and 'pid' not in data:
+    data['pid'] = pid
+    raw = json.dumps(data, ensure_ascii=False)
+
+try:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect('$SOCKET_PATH')
+    sock.sendall(raw.encode('utf-8'))
+    sock.shutdown(socket.SHUT_WR)
+    sock.close()
+except Exception:
+    pass
+"
+exit 0
+"#;
+        std::fs::write(&hook_path, hook_script).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows: forward the raw hook JSON untouched — only a "pid" prefix
+        // is injected after the leading '{', plus a rewrite of the rare
+        // PostToolUseFailure event. Everything is wrapped in try/catch so a
+        // missing socket (oc-claw not running) fails silently.
+        //
+        // WHY NODE AND NOT POWERSHELL: ZCode runs config hooks INLINE, so hook
+        // duration directly delays every tool call, and each hook gets killed
+        // at its timeoutMs. The previous PowerShell 5.1 script cold-started in
+        // ~0.5-1s and its Win32_Process WMI parent walk pushed total runtime
+        // past 3000ms -> ZCode logged hook.run.failed "timed_out" and oc-claw
+        // never received events. Node starts in ~150ms and `process.ppid`
+        // provides the parent pid for free; the Rust side walks ancestors from
+        // there to find the actual window process (ZCode.exe or the terminal),
+        // so no expensive in-hook process-tree query is needed. If node is not
+        // on PATH the hook fails to spawn — ZCode logs it and carries on
+        // (hook errors are non-fatal), same failure mode as the socket being
+        // unavailable.
+        let js_script = r#"// ooclaw ZCode hook - forwards hook JSON to oc-claw's TCP socket (127.0.0.1:19288).
+// Must stay well under the hook timeoutMs (3000): node start ~150ms, work ~10ms.
+let raw = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (c) => { raw += c; });
+process.stdin.on('end', () => {
+  try {
+    raw = raw.trim();
+    if (!raw.startsWith('{')) return; // silently ignore non-JSON input
+
+    // PostToolUseFailure is ZCode-specific. Rewrite before forwarding:
+    // - is_interrupted=true -> Stop   (ESC interrupt; oc-claw has no transcript
+    //                                  watcher for ZCode, so this is the only
+    //                                  reliable interrupt signal)
+    // - otherwise           -> PostToolUse (a failed tool does not end the turn)
+    if (raw.includes('"PostToolUseFailure"')) {
+      try {
+        const data = JSON.parse(raw);
+        if (data.hook_event_name === 'PostToolUseFailure') {
+          data.hook_event_name = data.is_interrupted ? 'Stop' : 'PostToolUse';
+          raw = JSON.stringify(data);
+        }
+      } catch (_) { /* unparsable -> forward as-is */ }
+    }
+
+    // Inject the immediate parent pid (the zcode core / terminal process) for
+    // click-to-jump; duplicate-key risk is fine (serde keeps the payload's own
+    // value if it ever grows a "pid" field).
+    if (process.ppid > 0) {
+      raw = '{"pid":' + process.ppid + ',' + raw.slice(1);
+    }
+
+    const net = require('net');
+    const client = net.connect(19288, '127.0.0.1');
+    client.on('connect', () => client.end(raw, 'utf8')); // end() also sends FIN
+    client.on('error', () => process.exit(0)); // oc-claw not running -> silent
+    client.on('close', () => process.exit(0));
+  } catch (_) { /* silent */ }
+});
+// Hard cap so a stalled stdin can never block ZCode until its own timeout.
+setTimeout(() => process.exit(0), 1500).unref();
+"#;
+        std::fs::write(&hook_path, js_script).map_err(|e| e.to_string())?;
+    }
+
+    // Merge hook config into ~/.zcode/cli/config.json
+    let config_path = zcode_dir.join("cli").join("config.json");
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut config: serde_json::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    if config.get("hooks").is_none() {
+        config["hooks"] = serde_json::json!({});
+    }
+    let hooks_obj = config["hooks"].as_object_mut().ok_or("hooks is not an object")?;
+    // Config-file hooks are disabled by default in ZCode; without this flag
+    // our registered events are silently ignored.
+    hooks_obj.insert("enabled".to_string(), serde_json::json!(true));
+    if hooks_obj.get("timeoutMs").is_none() {
+        hooks_obj.insert("timeoutMs".to_string(), serde_json::json!(1000));
+    }
+    if hooks_obj.get("events").map(|v| !v.is_object()).unwrap_or(true) {
+        hooks_obj.insert("events".to_string(), serde_json::json!({}));
+    }
+    let events = hooks_obj
+        .get_mut("events")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("hooks.events is not an object")?;
+
+    // Remove previous oc-claw entries, keep the user's own hooks intact.
+    for list in events.values_mut() {
+        if let Some(arr) = list.as_array_mut() {
+            arr.retain(|entry| !zcode_has_our_hook(entry));
+        }
+    }
+
+    #[cfg(windows)]
+    let hook_def = serde_json::json!({
+        "type": "process",
+        "command": "node",
+        "args": [hook_path.to_string_lossy().replace('\\', "/")],
+        "timeoutMs": 3000,
+    });
+    #[cfg(not(windows))]
+    let hook_def = serde_json::json!({
+        "type": "process",
+        "command": "/bin/bash",
+        "args": [hook_path.to_string_lossy()],
+        "timeoutMs": 3000,
+    });
+
+    for event_name in ZCODE_HOOK_EVENTS {
+        let arr = events
+            .entry(event_name.to_string())
+            .or_insert(serde_json::json!([]));
+        let list = arr.as_array_mut().ok_or("hook event is not an array")?;
+        list.push(serde_json::json!({"hooks": [hook_def.clone()]}));
+    }
+
+    let json_str = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&config_path, json_str).map_err(|e| e.to_string())?;
+
+    log::info!("[zcode_hooks] installed hooks to {:?}", config_path);
+    Ok(())
+}
+
 fn codex_requires_escalation(event: &serde_json::Value) -> bool {
     fn read_bool(v: &serde_json::Value, keys: &[&str]) -> bool {
         keys.iter()
@@ -13373,6 +13676,7 @@ fn process_claude_event(
                         "hermes" => 4,
                         "opencode" => 5,
                         "cursor" => 6,
+                        "zcode" => 7,
                         _ => 0,
                     }
                 };
@@ -13384,13 +13688,19 @@ fn process_claude_event(
                 // - PreToolUse with tool=Agent → a sub-agent is being launched
                 // - SubagentStop → a sub-agent has completed
                 // Sound only plays on Stop when pending_agents == 0 (all agents done).
+                // ZCode has NO SubagentStop event, so the counter would never
+                // decrement there — skip the increment entirely for zcode and
+                // let every Stop play its completion sound (ZCode subagents are
+                // synchronous tool calls that don't fire Stop on their own).
                 let tool_name = event.get("tool").or_else(|| event.get("tool_name"))
                     .and_then(|v| v.as_str()).unwrap_or("");
                 if hook_event == "UserPromptSubmit" {
                     // New user prompt = fresh start. Reset counter in case previous
                     // agents were killed or SubagentStop was never delivered.
                     session.pending_agents = 0;
-                } else if (hook_event == "PreToolUse" && tool_name == "Agent") || raw_hook_event == "subagentStart" {
+                } else if source != "zcode"
+                    && ((hook_event == "PreToolUse" && tool_name == "Agent") || raw_hook_event == "subagentStart")
+                {
                     session.pending_agents += 1;
                     log::info!("[claude_event] session={} Agent launched, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
@@ -16459,6 +16769,76 @@ fn start_gemini_socket_server(
     }
 }
 
+/// Start the ZCode IPC server.
+/// On macOS/Linux: Unix domain socket at /tmp/ooclaw-zcode.sock
+/// On Windows: TCP server on localhost:19288 (19283-19287 are taken by
+/// cc/cursor/gemini/hermes/opencode).
+/// ZCode handles permission approval in its own desktop UI, so events never
+/// block the socket (same as gemini/opencode — no PermissionRequest round-trip).
+fn start_zcode_socket_server(
+    claude_state: Arc<Mutex<HashMap<String, ClaudeSession>>>,
+    app: tauri::AppHandle,
+) {
+    #[cfg(unix)]
+    {
+        let socket_path = "/tmp/ooclaw-zcode.sock";
+        let _ = std::fs::remove_file(socket_path);
+        let listener = match std::os::unix::net::UnixListener::bind(socket_path) {
+            Ok(l) => l,
+            Err(e) => { log::warn!("[zcode_socket] bind failed: {}", e); return; }
+        };
+        log::info!("[zcode_socket] listening on {}", socket_path);
+
+        let state = Arc::clone(&claude_state);
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(mut stream) = stream {
+                    let state = Arc::clone(&state);
+                    let app = app2.clone();
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        let _ = stream.read_to_string(&mut buf);
+                        if !buf.is_empty() {
+                            process_claude_event(&buf, &state, &app, Some("zcode"));
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:19288") {
+            Ok(l) => l,
+            Err(e) => { log::warn!("[zcode_socket] TCP bind failed: {}", e); return; }
+        };
+        log::info!("[zcode_socket] listening on 127.0.0.1:19288");
+
+        let state = Arc::clone(&claude_state);
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(mut stream) = stream {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let state = Arc::clone(&state);
+                    let app = app2.clone();
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        let _ = stream.read_to_string(&mut buf);
+                        if !buf.is_empty() {
+                            process_claude_event(&buf, &state, &app, Some("zcode"));
+                        }
+                    });
+                }
+            }
+        });
+    }
+}
+
 /// Start the opencode IPC server.
 /// On macOS/Linux: Unix domain socket at /tmp/ooclaw-opencode.sock
 /// On Windows: TCP server on localhost:19287
@@ -17068,6 +17448,10 @@ pub fn run() {
             if let Err(e) = tauri::async_runtime::block_on(install_opencode_hooks()) {
                 log::warn!("Failed to install opencode plugin on startup: {}", e);
             }
+            // Install ZCode hooks on startup (idempotent, skips if ~/.zcode/ missing)
+            if let Err(e) = tauri::async_runtime::block_on(install_zcode_hooks()) {
+                log::warn!("Failed to install ZCode hooks on startup: {}", e);
+            }
             // Hermes plugin is NOT auto-installed on startup because it restarts
             // the gateway. User must manually install via Settings UI.
 
@@ -17325,6 +17709,14 @@ pub fn run() {
                 start_hermes_socket_server(sessions_arc, dismissed_arc, app.handle().clone());
             }
 
+            // Start ZCode socket server (shares ClaudeState for unified session tracking).
+            // Unix uses /tmp/ooclaw-zcode.sock, Windows uses TCP 127.0.0.1:19288.
+            {
+                let claude_state = app.state::<ClaudeState>();
+                let sessions_arc = Arc::clone(&claude_state.sessions);
+                start_zcode_socket_server(sessions_arc, app.handle().clone());
+            }
+
             // System tray — use saved language, fallback to system language
             let initial_lang = {
                 let store_path = app.path().app_data_dir().ok().map(|p| p.join("settings.json"));
@@ -17393,7 +17785,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, install_zcode_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())

@@ -27,7 +27,7 @@ interface ClaudeStats {
 }
 
 type ChartMetric = 'tokens' | 'messages'
-type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode'
+type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode' | 'zcode'
 
 function DailyChart({ stats }: { stats: DailyStats[] }) {
   const { t } = useTranslation()
@@ -275,11 +275,35 @@ export function ClaudeStatsView({ source = 'cc', isActive, channel, sshConn, her
           ? 'claudeStats.titleHermes'
           : source === 'opencode'
             ? 'claudeStats.titleOpencode'
-            : 'claudeStats.title'
+            : source === 'zcode'
+              ? 'claudeStats.titleZcode'
+              : 'claudeStats.title'
 
   if (source === 'cursor') {
     const unsupportedTitle = t('claudeStats.cursorUnsupportedTitle', 'Cursor 暂不支持详细统计')
     const unsupportedDesc = t('claudeStats.cursorUnsupportedDesc', 'Cursor 不向第三方工具暴露每次请求的 token 用量，oc-claw 无法在本地准确还原。请在 Cursor 应用内查看用量。')
+    return (
+      <div className="flex-1 min-h-0 px-5 py-5 flex flex-col gap-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-lg font-semibold text-white tracking-tight">{t(titleKey)}</h1>
+        </div>
+        <div className="flex-1 flex flex-col items-center justify-center gap-2 text-center px-6">
+          <span className="text-white/60 text-sm font-medium">
+            {unsupportedTitle}
+          </span>
+          <span className="text-white/40 text-xs leading-relaxed max-w-sm">
+            {unsupportedDesc}
+          </span>
+        </div>
+      </div>
+    )
+  }
+
+  // ZCode: session/token data lives in ZCode's own SQLite DB, which oc-claw
+  // does not parse yet — show the same unsupported hint as Cursor.
+  if (source === 'zcode') {
+    const unsupportedTitle = t('claudeStats.zcodeUnsupportedTitle', 'ZCode 暂不支持详细统计')
+    const unsupportedDesc = t('claudeStats.zcodeUnsupportedDesc', 'ZCode 的会话与 token 用量保存在其本地数据库中，oc-claw 暂无法解析。请在 ZCode 应用内查看用量。')
     return (
       <div className="flex-1 min-h-0 px-5 py-5 flex flex-col gap-6">
         <div className="flex items-center justify-between">

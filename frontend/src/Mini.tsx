@@ -114,7 +114,7 @@ const MASCOT_BASE_SIZE = 43
 const SESSION_SPRITE_DISPLAY_MULTIPLIER = 0.88
 
 type PetState = 'idle' | 'working' | 'compacting' | 'waiting'
-type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode'
+type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode' | 'zcode'
 const TRANSIENT_PET_ACTIONS: PetAction[] = ['eat', 'headpat', 'dance', 'farewell', 'angry', 'spin', 'milktea', 'walkout']
 
 // Priority: higher number = harder to interrupt
@@ -502,6 +502,7 @@ export default function Mini() {
     if (source === 'gemini') return 'gemini'
     if (source === 'hermes') return 'hermes'
     if (source === 'opencode') return 'opencode'
+    if (source === 'zcode') return 'zcode'
     return 'cc'
   }, [])
   const resolveClaudeStatsSourceBySession = useCallback(
@@ -524,6 +525,7 @@ export default function Mini() {
   const [enableCursor, setEnableCursor] = useState(true)
   const [enableGemini, setEnableGemini] = useState(true)
   const [enableOpencode, setEnableOpencode] = useState(true)
+  const [enableZcode, setEnableZcode] = useState(true)
   const [hermesConns, setHermesConns] = useState<{ id: string; type: 'local' | 'remote'; host?: string; user?: string }[]>([])
   // Hermes is enabled whenever at least one connection is configured, mirroring
   // the OpenClaw model (presence of a connection implies it is enabled).
@@ -2067,6 +2069,10 @@ export default function Mini() {
       const ocEnabled = oc !== false
       setEnableOpencode(ocEnabled)
       if (ocEnabled) invoke('install_opencode_hooks').catch(() => {})
+      const zc = await store.get('enable_zcode')
+      const zcEnabled = zc !== false
+      setEnableZcode(zcEnabled)
+      if (zcEnabled) invoke('install_zcode_hooks').catch(() => {})
       // Hermes plugin install is user-triggered only (restarts gateway).
       // Enablement now follows whether any connection is configured.
       const hermConns = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
@@ -2148,7 +2154,7 @@ export default function Mini() {
   // Poll Claude/Codex/Cursor sessions
   useEffect(() => {
     if (appMode !== 'coding') { setClaudeSessions([]); return }
-    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes)) {
+    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableZcode)) {
       setClaudeSessions([])
       return
     }
@@ -2338,7 +2344,7 @@ export default function Mini() {
     poll()
     const t = setInterval(poll, 2000)
     return () => clearInterval(t)
-  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, hermesConns, appMode])
+  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, enableZcode, hermesConns, appMode])
 
   // Listen for Claude/Codex/Cursor task completion → play sound
   const soundEnabledRef = useRef(soundEnabled)
@@ -2367,9 +2373,11 @@ export default function Mini() {
   enableClaudeCodeRef.current = enableClaudeCode
   const enableClaudeDesktopRef = useRef(enableClaudeDesktop)
   enableClaudeDesktopRef.current = enableClaudeDesktop
+  const enableZcodeRef = useRef(enableZcode)
+  enableZcodeRef.current = enableZcode
   useEffect(() => {
     if (appMode !== 'coding') return
-    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes)) return
+    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableZcode)) return
     const unlisten = listen('claude-task-complete', (ev: any) => {
       const currentSession = claudeSessionsRef.current.find((s) => s.sessionId === ev.payload?.sessionId)
       const isCursor = ev.payload?.source === 'cursor' || currentSession?.source === 'cursor'
@@ -2377,13 +2385,15 @@ export default function Mini() {
       const isGemini = ev.payload?.source === 'gemini' || currentSession?.source === 'gemini'
       const isOpencode = ev.payload?.source === 'opencode' || currentSession?.source === 'opencode'
       const isHermes = ev.payload?.source === 'hermes' || currentSession?.source === 'hermes'
+      const isZcode = ev.payload?.source === 'zcode' || currentSession?.source === 'zcode'
       const hostTerminal = ev.payload?.hostTerminal || currentSession?.hostTerminal
-      const isClaudeDesktop = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && hostTerminal === 'Claude Desktop'
-      const isClaudeCli = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && !isClaudeDesktop
+      const isClaudeDesktop = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && !isZcode && hostTerminal === 'Claude Desktop'
+      const isClaudeCli = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && !isZcode && !isClaudeDesktop
       // Drop the event entirely if the matching listener toggle is off, so
       // muted streams never trigger auto-expand or completion popups either.
       if (isClaudeDesktop && !enableClaudeDesktopRef.current) return
       if (isClaudeCli && !enableClaudeCodeRef.current) return
+      if (isZcode && !enableZcodeRef.current) return
       if (ev.payload?.waiting && viewModeRef.current === 'efficiency' && autoExpandOnTaskRef.current) {
         // Optimistically mark the session as waiting in the same React event
         // tick as the expand/collapse, so the panel's first frame already
@@ -2410,7 +2420,7 @@ export default function Mini() {
     return () => {
       unlisten.then((fn) => fn())
     }
-  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, appMode])
+  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, enableZcode, appMode])
 
   // Fetch OpenClaw session messages when selected
   useEffect(() => {
@@ -2515,6 +2525,7 @@ export default function Mini() {
     if (cs.source === 'gemini') return enableGemini
     if (cs.source === 'opencode') return enableOpencode
     if (cs.source === 'hermes') return enableHermes
+    if (cs.source === 'zcode') return enableZcode
     const isDesktop = cs.hostTerminal === 'Claude Desktop'
     return isDesktop ? enableClaudeDesktop : enableClaudeCode
   })
@@ -5180,9 +5191,10 @@ export default function Mini() {
                                 const isGeminiSource = cs.source === 'gemini'
                                 const isOpencodeSource = cs.source === 'opencode'
                                 const isHermesSource = cs.source === 'hermes'
+                                const isZcodeSource = cs.source === 'zcode'
                                 const isRemoteHermes = isHermesSource && cs.sessionId?.startsWith('ssh:')
-                                const sourceLabel = isCursorSource ? 'Cursor' : isCodexSource ? 'Codex' : isGeminiSource ? 'Gemini' : isOpencodeSource ? 'opencode' : isHermesSource ? 'Hermes' : 'Claude'
-                                const sourceBadgeClass = isCursorSource ? 'bg-[#1a2f3f] text-[#5eb5f7]' : isCodexSource ? 'bg-[#1d2f26] text-[#6dd29c]' : isGeminiSource ? 'bg-[#1d2736] text-[#8ab4f8]' : isOpencodeSource ? 'bg-[#2a2616] text-[#e6c07b]' : isHermesSource ? 'bg-[#2d1f3f] text-[#c084fc]' : 'bg-[#3f211d] text-[#e87a65]'
+                                const sourceLabel = isCursorSource ? 'Cursor' : isCodexSource ? 'Codex' : isGeminiSource ? 'Gemini' : isOpencodeSource ? 'opencode' : isHermesSource ? 'Hermes' : isZcodeSource ? 'ZCode' : 'Claude'
+                                const sourceBadgeClass = isCursorSource ? 'bg-[#1a2f3f] text-[#5eb5f7]' : isCodexSource ? 'bg-[#1d2f26] text-[#6dd29c]' : isGeminiSource ? 'bg-[#1d2736] text-[#8ab4f8]' : isOpencodeSource ? 'bg-[#2a2616] text-[#e6c07b]' : isHermesSource ? 'bg-[#2d1f3f] text-[#c084fc]' : isZcodeSource ? 'bg-[#12302e] text-[#5eead4]' : 'bg-[#3f211d] text-[#e87a65]'
                                 const openClaudeDetail = () => {
                                   setSelectedAgentId(null)
                                   setSelectedSessionKey(null)
@@ -5224,7 +5236,7 @@ export default function Mini() {
                                         }
                                         return
                                       }
-                                      if (!isWaiting || isGeminiSource || isOpencodeSource) {
+                                      if (!isWaiting || isGeminiSource || isOpencodeSource || isZcodeSource) {
                                         if (cs.source === 'cursor') {
                                           invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
                                         } else {
@@ -5232,7 +5244,7 @@ export default function Mini() {
                                         }
                                       }
                                     }}
-                                    className={`group hover:bg-white/[0.04] transition-colors ${(!isWaiting || isGeminiSource || isOpencodeSource || isHermesSource) ? 'cursor-pointer' : ''}`}
+                                    className={`group hover:bg-white/[0.04] transition-colors ${(!isWaiting || isGeminiSource || isOpencodeSource || isHermesSource || isZcodeSource) ? 'cursor-pointer' : ''}`}
                                     style={{ padding: '10px 16px' }}
                                   >
                                     <div className="flex min-w-0 w-full items-center gap-3">
@@ -5450,10 +5462,10 @@ export default function Mini() {
                                               hoverExpandedRef.current = false
                                               collapse()
                                             }
-                                            // Codex / Gemini approval should be made in their own UI.
+                                            // Codex / Gemini / ZCode approval should be made in their own UI.
                                             // oc-claw only surfaces a reminder and a jump action
                                             // so the user can approve there.
-                                            if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes') {
+                                            if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes' || cs.source === 'zcode') {
                                               const hermesPlatLabel = (() => {
                                                 if (cs.source !== 'hermes' || !cs.platform) return ''
                                                 const p = (cs.platform || '').toLowerCase()
@@ -5477,6 +5489,8 @@ export default function Mini() {
                                                 ? t('mini.viewInGemini', '前往 Gemini')
                                                 : cs.source === 'opencode'
                                                 ? t('mini.viewInOpencode', '前往 opencode')
+                                                : cs.source === 'zcode'
+                                                ? t('mini.viewInZcode', '前往 ZCode')
                                                 : t('mini.viewInCodex', '前往 Codex')
                                               return (
                                                 <>

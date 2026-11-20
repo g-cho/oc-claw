@@ -369,6 +369,7 @@
     "titleGemini": "Statistiques Gemini CLI",
     "titleHermes": "Statistiques Hermes Agent",
     "titleOpencode": "Statistiques opencode",
+    "titleZcode": "Statistiques ZCode",
     "last14Days": "14 derniers jours",
     "totalTokens": "Tokens totaux",
     "sessionsCount": "session(s)",
